@@ -1,7 +1,27 @@
 #!/usr/bin/env python3
 """
-Stock Options Dashboard for Google Colab
+Stock Options Dashboard for Google Colab with ngrok Integration
 A self-contained Flask web application for analyzing stock options data with Greeks
+
+🚀 GOOGLE COLAB SETUP INSTRUCTIONS:
+1. Run this entire script in a single Colab cell
+2. For public access via ngrok:
+   - Sign up for free at: https://ngrok.com
+   - Get your auth token from: https://dashboard.ngrok.com/get-started/your-authtoken  
+   - Run: !ngrok authtoken YOUR_TOKEN_HERE
+   - Or uncomment and modify the ngrok.set_auth_token() line below
+3. Access your dashboard via the provided public URL
+4. Share the public URL with anyone to access your dashboard!
+
+📋 FEATURES:
+• Interactive options data analysis for multiple tickers
+• Complete Greeks calculations (Delta, Gamma, Theta, Vega)
+• Advanced filtering system with conservative presets
+• At-the-money (ATM) filtering
+• Days to expiration filtering
+• Educational content about options trading
+• Mobile-responsive design
+• Public access via ngrok tunnel
 """
 
 # Install required packages
@@ -16,7 +36,8 @@ def install_packages():
         'numpy',
         'scipy',
         'requests',
-        'flask-cors'
+        'flask-cors',
+        'pyngrok'
     ]
     
     for package in packages:
@@ -37,6 +58,7 @@ import yfinance as yf
 from scipy.stats import norm
 from flask import Flask, render_template_string, jsonify, request
 from flask_cors import CORS
+from pyngrok import ngrok
 import json
 import warnings
 warnings.filterwarnings('ignore')
@@ -986,6 +1008,57 @@ def run_flask_app():
     """Run Flask app in a separate thread"""
     app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
 
+def setup_ngrok_auth():
+    """Help users setup ngrok authentication"""
+    print("🔐 Setting up ngrok authentication...")
+    print("📝 To use ngrok, you need a free account and auth token:")
+    print("   1. Sign up at: https://ngrok.com")
+    print("   2. Get your auth token from: https://dashboard.ngrok.com/get-started/your-authtoken")
+    print("   3. Run this command to set your auth token:")
+    print("      !ngrok authtoken YOUR_TOKEN_HERE")
+    print("   4. Or set it programmatically (uncomment the line below in the code)")
+    print("      # ngrok.set_auth_token('YOUR_TOKEN_HERE')")
+
+def setup_ngrok():
+    """Setup ngrok tunnel"""
+    try:
+        # Kill any existing ngrok processes
+        ngrok.kill()
+        
+        # Uncomment the line below and add your ngrok auth token if needed
+        # ngrok.set_auth_token("YOUR_NGROK_AUTH_TOKEN_HERE")
+        
+        # Create tunnel to Flask app with custom options
+        public_tunnel = ngrok.connect(
+            5000,
+            proto="http",
+            options={"bind_tls": True}  # Force HTTPS
+        )
+        public_url = public_tunnel.public_url
+        
+        print(f"🌐 ngrok tunnel established!")
+        print(f"🔗 Public URL: {public_url}")
+        print(f"🔗 Local URL: http://localhost:5000")
+        print(f"📊 ngrok Web Interface: http://localhost:4040")
+        
+        return public_url
+        
+    except Exception as e:
+        error_msg = str(e).lower()
+        print(f"⚠️  ngrok setup failed: {e}")
+        
+        if "authtoken" in error_msg or "authentication" in error_msg:
+            print("\n🔐 Authentication Required:")
+            setup_ngrok_auth()
+        else:
+            print("💡 This might be due to:")
+            print("   • Network restrictions")
+            print("   • ngrok service unavailable")
+            print("   • Port already in use")
+        
+        print("📋 You can still access the dashboard locally at: http://localhost:5000")
+        return None
+
 def main():
     """Main function to run the application"""
     print("🚀 Starting Stock Options Dashboard...")
@@ -998,10 +1071,22 @@ def main():
     # Wait a moment for Flask to start
     time.sleep(3)
     
+    # Setup ngrok tunnel
+    print("\n🔗 Setting up ngrok tunnel...")
+    public_url = setup_ngrok()
+    
     print("\n" + "="*60)
     print("✅ Stock Options Dashboard is running!")
     print("="*60)
-    print("🌐 Access your dashboard at: http://localhost:5000")
+    
+    if public_url:
+        print(f"🌍 Public Access: {public_url}")
+        print(f"🏠 Local Access: http://localhost:5000")
+        print("\n💡 Share the public URL with anyone to access your dashboard!")
+    else:
+        print("🏠 Local Access: http://localhost:5000")
+        print("💡 If you need public access, you can manually setup ngrok")
+    
     print("\n📋 Features available:")
     print("   • Interactive options data for multiple tickers")
     print("   • Complete Greeks calculations (Delta, Gamma, Theta, Vega)")
@@ -1021,6 +1106,12 @@ def main():
             time.sleep(1)
     except KeyboardInterrupt:
         print("\n🛑 Dashboard stopped by user")
+        print("🔄 Cleaning up ngrok tunnel...")
+        try:
+            ngrok.kill()
+            print("✅ ngrok tunnel closed")
+        except:
+            pass
 
 if __name__ == "__main__":
     main()
