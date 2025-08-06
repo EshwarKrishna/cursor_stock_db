@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 Stock Options Dashboard for Google Colab
-A self-contained Flask web application that displays live stock options data
-with interactive filtering and Greeks analysis.
+A self-contained Flask web application for analyzing stock options data with Greeks
 """
 
 # Install required packages
@@ -15,214 +14,219 @@ def install_packages():
         'yfinance',
         'pandas',
         'numpy',
+        'scipy',
         'requests',
-        'flask-cors',
-        'threading'
+        'flask-cors'
     ]
     
     for package in packages:
         try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-            print(f"✓ Installed {package}")
-        except subprocess.CalledProcessError:
-            print(f"✗ Failed to install {package}")
+            __import__(package.replace('-', '_'))
+        except ImportError:
+            print(f"Installing {package}...")
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', package])
 
-print("Installing required packages...")
 install_packages()
-print("Package installation complete!\n")
 
-# Import libraries
-import yfinance as yf
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-from flask import Flask, render_template_string, jsonify, request
-from flask_cors import CORS
 import threading
 import time
-import json
+from datetime import datetime, timedelta
+import pandas as pd
+import numpy as np
+import yfinance as yf
 from scipy.stats import norm
+from flask import Flask, render_template_string, jsonify, request
+from flask_cors import CORS
+import json
 import warnings
 warnings.filterwarnings('ignore')
 
-# Global variables
+class OptionsAnalyzer:
+    def __init__(self):
+        self.data_cache = {}
+        self.cache_timestamp = {}
+        self.cache_duration = 300  # 5 minutes
+    
+    def get_risk_free_rate(self):
+        """Get current risk-free rate (10-year Treasury)"""
+        try:
+            treasury = yf.Ticker("^TNX")
+            hist = treasury.history(period="5d")
+            if not hist.empty:
+                return hist['Close'].iloc[-1] / 100
+        except:
+            pass
+        return 0.045  # Default 4.5%
+    
+    def calculate_greeks(self, S, K, T, r, sigma, option_type='call'):
+        """Calculate option Greeks using Black-Scholes model"""
+        if T <= 0 or sigma <= 0:
+            return {'delta': 0, 'gamma': 0, 'theta': 0, 'vega': 0}
+        
+        try:
+            d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+            d2 = d1 - sigma * np.sqrt(T)
+            
+            if option_type == 'call':
+                delta = norm.cdf(d1)
+                theta = (-(S * norm.pdf(d1) * sigma) / (2 * np.sqrt(T)) 
+                        - r * K * np.exp(-r * T) * norm.cdf(d2)) / 365
+            else:  # put
+                delta = norm.cdf(d1) - 1
+                theta = (-(S * norm.pdf(d1) * sigma) / (2 * np.sqrt(T)) 
+                        + r * K * np.exp(-r * T) * norm.cdf(-d2)) / 365
+            
+            gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
+            vega = S * norm.pdf(d1) * np.sqrt(T) / 100
+            
+            return {
+                'delta': round(delta, 4),
+                'gamma': round(gamma, 4),
+                'theta': round(theta, 4),
+                'vega': round(vega, 4)
+            }
+        except:
+            return {'delta': 0, 'gamma': 0, 'theta': 0, 'vega': 0}
+    
+    def get_options_data(self, ticker, target_days=[90, 120, 150]):
+        """Fetch options data for specified ticker and target days"""
+        cache_key = f"{ticker}_{'-'.join(map(str, target_days))}"
+        
+        # Check cache
+        if (cache_key in self.data_cache and 
+            cache_key in self.cache_timestamp and
+            time.time() - self.cache_timestamp[cache_key] < self.cache_duration):
+            return self.data_cache[cache_key]
+        
+        try:
+            stock = yf.Ticker(ticker)
+            stock_info = stock.info
+            current_price = stock_info.get('currentPrice', stock_info.get('regularMarketPrice', 0))
+            
+            if current_price == 0:
+                hist = stock.history(period="1d")
+                if not hist.empty:
+                    current_price = hist['Close'].iloc[-1]
+            
+            expirations = stock.options
+            if not expirations:
+                return None
+            
+            current_date = datetime.now()
+            target_expirations = []
+            
+            # Find closest expiration dates to target days
+            for target_days_val in target_days:
+                target_date = current_date + timedelta(days=target_days_val)
+                closest_exp = None
+                min_diff = float('inf')
+                
+                for exp_str in expirations:
+                    exp_date = datetime.strptime(exp_str, '%Y-%m-%d')
+                    diff = abs((exp_date - target_date).days)
+                    if diff < min_diff:
+                        min_diff = diff
+                        closest_exp = exp_str
+                
+                if closest_exp and closest_exp not in target_expirations:
+                    target_expirations.append(closest_exp)
+            
+            risk_free_rate = self.get_risk_free_rate()
+            result = {
+                'ticker': ticker,
+                'current_price': current_price,
+                'risk_free_rate': risk_free_rate,
+                'expirations': {}
+            }
+            
+            for exp_date in target_expirations:
+                try:
+                    option_chain = stock.option_chain(exp_date)
+                    exp_datetime = datetime.strptime(exp_date, '%Y-%m-%d')
+                    days_to_expiry = (exp_datetime - current_date).days
+                    time_to_expiry = days_to_expiry / 365.0
+                    
+                    calls_data = []
+                    puts_data = []
+                    
+                    # Process calls
+                    for _, call in option_chain.calls.iterrows():
+                        iv = call.get('impliedVolatility', 0)
+                        if pd.isna(iv):
+                            iv = 0
+                        
+                        greeks = self.calculate_greeks(
+                            current_price, call['strike'], time_to_expiry, 
+                            risk_free_rate, iv, 'call'
+                        )
+                        
+                        call_data = {
+                            'strike': call['strike'],
+                            'lastPrice': call.get('lastPrice', 0),
+                            'bid': call.get('bid', 0),
+                            'ask': call.get('ask', 0),
+                            'volume': call.get('volume', 0),
+                            'openInterest': call.get('openInterest', 0),
+                            'impliedVolatility': iv,
+                            'delta': greeks['delta'],
+                            'gamma': greeks['gamma'],
+                            'theta': greeks['theta'],
+                            'vega': greeks['vega'],
+                            'moneyness': abs(call['strike'] - current_price)
+                        }
+                        calls_data.append(call_data)
+                    
+                    # Process puts
+                    for _, put in option_chain.puts.iterrows():
+                        iv = put.get('impliedVolatility', 0)
+                        if pd.isna(iv):
+                            iv = 0
+                        
+                        greeks = self.calculate_greeks(
+                            current_price, put['strike'], time_to_expiry, 
+                            risk_free_rate, iv, 'put'
+                        )
+                        
+                        put_data = {
+                            'strike': put['strike'],
+                            'lastPrice': put.get('lastPrice', 0),
+                            'bid': put.get('bid', 0),
+                            'ask': put.get('ask', 0),
+                            'volume': put.get('volume', 0),
+                            'openInterest': put.get('openInterest', 0),
+                            'impliedVolatility': iv,
+                            'delta': greeks['delta'],
+                            'gamma': greeks['gamma'],
+                            'theta': greeks['theta'],
+                            'vega': greeks['vega'],
+                            'moneyness': abs(put['strike'] - current_price)
+                        }
+                        puts_data.append(put_data)
+                    
+                    result['expirations'][exp_date] = {
+                        'days_to_expiry': days_to_expiry,
+                        'calls': calls_data,
+                        'puts': puts_data
+                    }
+                    
+                except Exception as e:
+                    print(f"Error processing {exp_date}: {e}")
+                    continue
+            
+            # Cache the result
+            self.data_cache[cache_key] = result
+            self.cache_timestamp[cache_key] = time.time()
+            
+            return result
+            
+        except Exception as e:
+            print(f"Error fetching data for {ticker}: {e}")
+            return None
+
+# Initialize Flask app
 app = Flask(__name__)
 CORS(app)
-options_data = {}
-tickers_list = []
-
-def black_scholes_greeks(S, K, T, r, sigma, option_type='call'):
-    """
-    Calculate Black-Scholes Greeks
-    S: Current stock price
-    K: Strike price
-    T: Time to expiration (in years)
-    r: Risk-free rate
-    sigma: Implied volatility
-    """
-    if T <= 0 or sigma <= 0:
-        return {'delta': 0, 'gamma': 0, 'theta': 0, 'vega': 0}
-    
-    try:
-        d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-        d2 = d1 - sigma * np.sqrt(T)
-        
-        if option_type == 'call':
-            delta = norm.cdf(d1)
-            theta = (-S * norm.pdf(d1) * sigma / (2 * np.sqrt(T)) 
-                    - r * K * np.exp(-r * T) * norm.cdf(d2)) / 365
-        else:  # put
-            delta = -norm.cdf(-d1)
-            theta = (-S * norm.pdf(d1) * sigma / (2 * np.sqrt(T)) 
-                    + r * K * np.exp(-r * T) * norm.cdf(-d2)) / 365
-        
-        gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
-        vega = S * norm.pdf(d1) * np.sqrt(T) / 100
-        
-        return {
-            'delta': round(delta, 4),
-            'gamma': round(gamma, 4),
-            'theta': round(theta, 4),
-            'vega': round(vega, 4)
-        }
-    except:
-        return {'delta': 0, 'gamma': 0, 'theta': 0, 'vega': 0}
-
-def get_target_expiration_dates(current_date, target_days=[90, 120, 150]):
-    """Get target expiration dates approximately 90, 120, and 150 days out"""
-    target_dates = []
-    for days in target_days:
-        target_date = current_date + timedelta(days=days)
-        target_dates.append(target_date)
-    return target_dates
-
-def find_closest_expiration(available_dates, target_date):
-    """Find the closest available expiration date to the target"""
-    if not available_dates:
-        return None
-    
-    available_dates = [datetime.strptime(date, '%Y-%m-%d').date() if isinstance(date, str) else date for date in available_dates]
-    target_date = target_date.date() if isinstance(target_date, datetime) else target_date
-    
-    closest_date = min(available_dates, key=lambda x: abs((x - target_date).days))
-    return closest_date.strftime('%Y-%m-%d')
-
-def fetch_options_data(ticker_symbol):
-    """Fetch options data for a given ticker"""
-    try:
-        ticker = yf.Ticker(ticker_symbol)
-        stock_info = ticker.info
-        current_price = stock_info.get('currentPrice', stock_info.get('regularMarketPrice', 0))
-        
-        if current_price == 0:
-            # Fallback to history
-            hist = ticker.history(period="1d")
-            if not hist.empty:
-                current_price = hist['Close'].iloc[-1]
-        
-        expiration_dates = ticker.options
-        if not expiration_dates:
-            return None
-        
-        current_date = datetime.now()
-        target_dates = get_target_expiration_dates(current_date)
-        
-        selected_expirations = []
-        for target_date in target_dates:
-            closest_exp = find_closest_expiration(expiration_dates, target_date)
-            if closest_exp and closest_exp not in selected_expirations:
-                selected_expirations.append(closest_exp)
-        
-        options_data_by_exp = {}
-        
-        for exp_date in selected_expirations:
-            try:
-                option_chain = ticker.option_chain(exp_date)
-                calls = option_chain.calls
-                puts = option_chain.puts
-                
-                # Calculate days to expiration
-                exp_datetime = datetime.strptime(exp_date, '%Y-%m-%d')
-                days_to_exp = (exp_datetime - current_date).days
-                time_to_exp = days_to_exp / 365.0
-                
-                # Process calls
-                calls_processed = []
-                for _, call in calls.iterrows():
-                    greeks = black_scholes_greeks(
-                        current_price, call['strike'], time_to_exp, 0.02, 
-                        call.get('impliedVolatility', 0.2), 'call'
-                    )
-                    
-                    calls_processed.append({
-                        'strike': call['strike'],
-                        'lastPrice': call.get('lastPrice', 0),
-                        'bid': call.get('bid', 0),
-                        'ask': call.get('ask', 0),
-                        'volume': call.get('volume', 0),
-                        'openInterest': call.get('openInterest', 0),
-                        'impliedVolatility': call.get('impliedVolatility', 0),
-                        'delta': greeks['delta'],
-                        'gamma': greeks['gamma'],
-                        'theta': greeks['theta'],
-                        'vega': greeks['vega'],
-                        'daysToExpiration': days_to_exp
-                    })
-                
-                # Process puts
-                puts_processed = []
-                for _, put in puts.iterrows():
-                    greeks = black_scholes_greeks(
-                        current_price, put['strike'], time_to_exp, 0.02, 
-                        put.get('impliedVolatility', 0.2), 'put'
-                    )
-                    
-                    puts_processed.append({
-                        'strike': put['strike'],
-                        'lastPrice': put.get('lastPrice', 0),
-                        'bid': put.get('bid', 0),
-                        'ask': put.get('ask', 0),
-                        'volume': put.get('volume', 0),
-                        'openInterest': put.get('openInterest', 0),
-                        'impliedVolatility': put.get('impliedVolatility', 0),
-                        'delta': greeks['delta'],
-                        'gamma': greeks['gamma'],
-                        'theta': greeks['theta'],
-                        'vega': greeks['vega'],
-                        'daysToExpiration': days_to_exp
-                    })
-                
-                options_data_by_exp[exp_date] = {
-                    'calls': calls_processed,
-                    'puts': puts_processed,
-                    'daysToExpiration': days_to_exp
-                }
-                
-            except Exception as e:
-                print(f"Error processing {exp_date} for {ticker_symbol}: {e}")
-                continue
-        
-        return {
-            'ticker': ticker_symbol,
-            'currentPrice': current_price,
-            'expirations': options_data_by_exp
-        }
-        
-    except Exception as e:
-        print(f"Error fetching data for {ticker_symbol}: {e}")
-        return None
-
-def update_options_data():
-    """Update options data for all tickers"""
-    global options_data
-    for ticker in tickers_list:
-        print(f"Fetching data for {ticker}...")
-        data = fetch_options_data(ticker)
-        if data:
-            options_data[ticker] = data
-            print(f"✓ Updated data for {ticker}")
-        else:
-            print(f"✗ Failed to fetch data for {ticker}")
+analyzer = OptionsAnalyzer()
 
 # HTML Template
 HTML_TEMPLATE = """
@@ -256,7 +260,7 @@ HTML_TEMPLATE = """
         }
         
         .header {
-            background: linear-gradient(135deg, #2c3e50, #3498db);
+            background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%);
             color: white;
             padding: 30px;
             text-align: center;
@@ -268,266 +272,265 @@ HTML_TEMPLATE = """
         }
         
         .header p {
-            font-size: 1.2em;
+            font-size: 1.1em;
             opacity: 0.9;
         }
         
-        .controls {
+        .input-section {
             padding: 30px;
             background: #f8f9fa;
             border-bottom: 1px solid #e9ecef;
         }
         
-        .filter-section {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 20px;
-            margin-bottom: 20px;
-        }
-        
-        .filter-group {
-            background: white;
-            padding: 20px;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }
-        
-        .filter-group h3 {
-            color: #2c3e50;
-            margin-bottom: 15px;
-            font-size: 1.1em;
-        }
-        
-        .filter-input {
-            display: flex;
-            flex-direction: column;
-            gap: 8px;
-        }
-        
-        .filter-input label {
-            font-weight: 600;
-            color: #555;
-            font-size: 0.9em;
-        }
-        
-        .filter-input input, .filter-input select {
-            padding: 10px;
-            border: 2px solid #e9ecef;
-            border-radius: 5px;
-            font-size: 1em;
-            transition: border-color 0.3s;
-        }
-        
-        .filter-input input:focus, .filter-input select:focus {
-            outline: none;
-            border-color: #3498db;
-        }
-        
-        .buttons {
+        .input-group {
             display: flex;
             gap: 15px;
-            justify-content: center;
+            align-items: center;
             flex-wrap: wrap;
         }
         
-        .btn {
-            padding: 12px 25px;
-            border: none;
-            border-radius: 25px;
-            font-size: 1em;
+        .input-group label {
             font-weight: 600;
+            color: #2c3e50;
+        }
+        
+        .input-group input {
+            flex: 1;
+            min-width: 300px;
+            padding: 12px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            font-size: 16px;
+            transition: border-color 0.3s;
+        }
+        
+        .input-group input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        .btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
             cursor: pointer;
-            transition: all 0.3s;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-        
-        .btn-primary {
-            background: linear-gradient(135deg, #3498db, #2980b9);
-            color: white;
-        }
-        
-        .btn-secondary {
-            background: linear-gradient(135deg, #95a5a6, #7f8c8d);
-            color: white;
-        }
-        
-        .btn-success {
-            background: linear-gradient(135deg, #27ae60, #229954);
-            color: white;
+            font-size: 16px;
+            font-weight: 600;
+            transition: transform 0.2s, box-shadow 0.2s;
         }
         
         .btn:hover {
             transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+        
+        .filters-section {
+            padding: 20px 30px;
+            background: #f1f3f4;
+            border-bottom: 1px solid #e9ecef;
+        }
+        
+        .filters-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        
+        .filter-group {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+        
+        .filter-group label {
+            font-weight: 600;
+            color: #2c3e50;
+            font-size: 14px;
+        }
+        
+        .filter-group input, .filter-group select {
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+        
+        .filter-buttons {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        
+        .btn-secondary {
+            background: linear-gradient(135deg, #95a5a6 0%, #7f8c8d 100%);
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: transform 0.2s;
+        }
+        
+        .btn-secondary:hover {
+            transform: translateY(-1px);
         }
         
         .loading {
             text-align: center;
-            padding: 40px;
-            font-size: 1.2em;
+            padding: 50px;
+            font-size: 18px;
             color: #666;
+        }
+        
+        .error {
+            background: #f8d7da;
+            color: #721c24;
+            padding: 15px;
+            margin: 20px;
+            border-radius: 8px;
+            border: 1px solid #f5c6cb;
         }
         
         .ticker-section {
             margin: 30px;
             background: white;
-            border-radius: 15px;
-            box-shadow: 0 5px 20px rgba(0,0,0,0.1);
+            border-radius: 10px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
             overflow: hidden;
         }
         
         .ticker-header {
-            background: linear-gradient(135deg, #e74c3c, #c0392b);
+            background: linear-gradient(135deg, #3498db 0%, #2980b9 100%);
             color: white;
-            padding: 20px 30px;
+            padding: 20px;
             display: flex;
             justify-content: space-between;
             align-items: center;
         }
         
-        .ticker-header h2 {
-            font-size: 1.8em;
-        }
-        
-        .current-price {
+        .ticker-name {
             font-size: 1.5em;
             font-weight: bold;
         }
         
+        .current-price {
+            font-size: 1.3em;
+            background: rgba(255,255,255,0.2);
+            padding: 8px 16px;
+            border-radius: 20px;
+        }
+        
         .expiration-section {
-            margin: 20px 30px;
+            border-bottom: 1px solid #e9ecef;
         }
         
         .expiration-header {
-            background: #34495e;
-            color: white;
+            background: #ecf0f1;
             padding: 15px 20px;
-            border-radius: 10px;
-            margin-bottom: 20px;
-        }
-        
-        .expiration-header h3 {
-            font-size: 1.3em;
+            font-weight: 600;
+            color: #2c3e50;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
         }
         
         .options-container {
             display: grid;
             grid-template-columns: 1fr 1fr;
-            gap: 20px;
+            gap: 0;
         }
         
         .options-type {
-            background: #f8f9fa;
-            border-radius: 10px;
-            overflow: hidden;
+            padding: 20px;
         }
         
         .options-type h4 {
-            background: #2c3e50;
-            color: white;
-            padding: 15px;
-            margin: 0;
-            font-size: 1.2em;
-            text-align: center;
+            color: #2c3e50;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #3498db;
         }
         
-        .calls-header {
-            background: #27ae60 !important;
-        }
-        
-        .puts-header {
-            background: #e74c3c !important;
+        .calls-section {
+            border-right: 1px solid #e9ecef;
         }
         
         .options-table {
             width: 100%;
             border-collapse: collapse;
+            font-size: 12px;
         }
         
         .options-table th {
-            background: #ecf0f1;
-            padding: 12px 8px;
+            background: #34495e;
+            color: white;
+            padding: 8px 4px;
             text-align: center;
             font-weight: 600;
-            color: #2c3e50;
-            font-size: 0.9em;
-            border-bottom: 2px solid #bdc3c7;
+            font-size: 11px;
         }
         
         .options-table td {
-            padding: 10px 8px;
+            padding: 6px 4px;
             text-align: center;
-            border-bottom: 1px solid #ecf0f1;
-            font-size: 0.85em;
+            border-bottom: 1px solid #e9ecef;
         }
         
         .options-table tr:hover {
-            background: #f1f2f6;
+            background: #f8f9fa;
         }
         
-        .atm-row {
+        .atm-option {
             background: #fff3cd !important;
             font-weight: bold;
         }
         
-        .notes {
+        .notes-section {
             margin: 30px;
+            background: #e8f4f8;
+            border-radius: 10px;
             padding: 25px;
-            background: #f8f9fa;
-            border-radius: 15px;
             border-left: 5px solid #3498db;
         }
         
-        .notes h3 {
+        .notes-section h3 {
             color: #2c3e50;
-            margin-bottom: 20px;
-            font-size: 1.4em;
+            margin-bottom: 15px;
         }
         
         .greeks-explanation {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 20px;
-            margin-bottom: 25px;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
         }
         
         .greek-item {
             background: white;
             padding: 15px;
-            border-radius: 10px;
+            border-radius: 8px;
             box-shadow: 0 2px 5px rgba(0,0,0,0.1);
         }
         
         .greek-item h4 {
-            color: #e74c3c;
+            color: #3498db;
             margin-bottom: 8px;
         }
         
-        .conservative-section {
-            background: white;
-            padding: 20px;
-            border-radius: 10px;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        .conservative-notes {
+            background: #d1ecf1;
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #bee5eb;
         }
         
-        .conservative-section h4 {
-            color: #27ae60;
-            margin-bottom: 15px;
-        }
-        
-        .conservative-list {
-            list-style: none;
-            padding: 0;
-        }
-        
-        .conservative-list li {
-            padding: 8px 0;
-            border-bottom: 1px solid #ecf0f1;
-        }
-        
-        .conservative-list li:last-child {
-            border-bottom: none;
+        .conservative-notes h4 {
+            color: #0c5460;
+            margin-bottom: 10px;
         }
         
         @media (max-width: 768px) {
@@ -535,18 +538,18 @@ HTML_TEMPLATE = """
                 grid-template-columns: 1fr;
             }
             
-            .filter-section {
-                grid-template-columns: 1fr;
+            .calls-section {
+                border-right: none;
+                border-bottom: 1px solid #e9ecef;
             }
             
-            .buttons {
+            .input-group {
                 flex-direction: column;
+                align-items: stretch;
             }
             
-            .ticker-header {
-                flex-direction: column;
-                gap: 10px;
-                text-align: center;
+            .input-group input {
+                min-width: auto;
             }
         }
     </style>
@@ -555,164 +558,354 @@ HTML_TEMPLATE = """
     <div class="container">
         <div class="header">
             <h1>📈 Stock Options Dashboard</h1>
-            <p>Interactive Options Analysis with Greeks & Filtering</p>
+            <p>Advanced Options Analysis with Greeks and Filtering</p>
         </div>
         
-        <div class="controls">
-            <div class="filter-section">
+        <div class="input-section">
+            <div class="input-group">
+                <label for="tickers">Stock Tickers:</label>
+                <input type="text" id="tickers" placeholder="Enter comma-separated tickers (e.g., AAPL, MSFT, TSLA)" value="AAPL, MSFT">
+                <button class="btn" onclick="fetchData()">Analyze Options</button>
+            </div>
+        </div>
+        
+        <div class="filters-section">
+            <div class="filters-grid">
                 <div class="filter-group">
-                    <h3>Greeks Filters</h3>
-                    <div class="filter-input">
-                        <label>Delta Range:</label>
-                        <input type="number" id="deltaMin" step="0.01" placeholder="Min Delta">
-                        <input type="number" id="deltaMax" step="0.01" placeholder="Max Delta">
-                    </div>
+                    <label for="minDelta">Min Delta:</label>
+                    <input type="number" id="minDelta" step="0.01" value="-1" min="-1" max="1">
                 </div>
-                
                 <div class="filter-group">
-                    <h3>Volume & Interest</h3>
-                    <div class="filter-input">
-                        <label>Min Volume:</label>
-                        <input type="number" id="minVolume" placeholder="Min Volume">
-                        <label>Min Open Interest:</label>
-                        <input type="number" id="minOpenInterest" placeholder="Min OI">
-                    </div>
+                    <label for="maxDelta">Max Delta:</label>
+                    <input type="number" id="maxDelta" step="0.01" value="1" min="-1" max="1">
                 </div>
-                
                 <div class="filter-group">
-                    <h3>Days to Expiration</h3>
-                    <div class="filter-input">
-                        <label>Min Days:</label>
-                        <input type="number" id="minDays" placeholder="Min Days">
-                        <label>Max Days:</label>
-                        <input type="number" id="maxDays" placeholder="Max Days">
-                    </div>
+                    <label for="minGamma">Min Gamma:</label>
+                    <input type="number" id="minGamma" step="0.001" value="0">
                 </div>
-                
                 <div class="filter-group">
-                    <h3>Advanced Greeks</h3>
-                    <div class="filter-input">
-                        <label>Max Theta (absolute):</label>
-                        <input type="number" id="maxTheta" step="0.01" placeholder="Max |Theta|">
-                        <label>Min Vega:</label>
-                        <input type="number" id="minVega" step="0.01" placeholder="Min Vega">
-                    </div>
+                    <label for="maxGamma">Max Gamma:</label>
+                    <input type="number" id="maxGamma" step="0.001" value="1">
+                </div>
+                <div class="filter-group">
+                    <label for="minTheta">Min Theta:</label>
+                    <input type="number" id="minTheta" step="0.01" value="-10">
+                </div>
+                <div class="filter-group">
+                    <label for="maxTheta">Max Theta:</label>
+                    <input type="number" id="maxTheta" step="0.01" value="10">
+                </div>
+                <div class="filter-group">
+                    <label for="minVega">Min Vega:</label>
+                    <input type="number" id="minVega" step="0.01" value="0">
+                </div>
+                <div class="filter-group">
+                    <label for="maxVega">Max Vega:</label>
+                    <input type="number" id="maxVega" step="0.01" value="10">
+                </div>
+                <div class="filter-group">
+                    <label for="minVolume">Min Volume:</label>
+                    <input type="number" id="minVolume" value="0">
+                </div>
+                <div class="filter-group">
+                    <label for="minOpenInterest">Min Open Interest:</label>
+                    <input type="number" id="minOpenInterest" value="0">
+                </div>
+                <div class="filter-group">
+                    <label for="atmFilter">ATM Filter:</label>
+                    <select id="atmFilter">
+                        <option value="all">All Strikes</option>
+                        <option value="atm">±3 Strikes from ATM</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label for="daysFilter">Days to Expiration:</label>
+                    <select id="daysFilter">
+                        <option value="all">All Expirations</option>
+                        <option value="30">≤ 30 days</option>
+                        <option value="60">≤ 60 days</option>
+                        <option value="90">≤ 90 days</option>
+                        <option value="120">≤ 120 days</option>
+                    </select>
                 </div>
             </div>
             
-            <div class="buttons">
-                <button class="btn btn-success" onclick="applyConservativeFilters()">Conservative Defaults</button>
-                <button class="btn btn-primary" onclick="applyFilters()">Apply Filters</button>
-                <button class="btn btn-secondary" onclick="clearFilters()">Clear Filters</button>
-                <button class="btn btn-primary" onclick="toggleATM()">Toggle ATM Only</button>
-                <button class="btn btn-secondary" onclick="refreshData()">Refresh Data</button>
+            <div class="filter-buttons">
+                <button class="btn-secondary" onclick="setConservativeFilters()">Conservative Defaults</button>
+                <button class="btn-secondary" onclick="resetFilters()">Reset Filters</button>
+                <button class="btn-secondary" onclick="applyFilters()">Apply Filters</button>
             </div>
         </div>
         
-        <div id="content">
-            <div class="loading">
-                <p>📊 Loading options data...</p>
-                <p>This may take a few moments for multiple tickers.</p>
-            </div>
+        <div id="loading" class="loading" style="display: none;">
+            <p>🔄 Fetching options data...</p>
         </div>
         
-        <div class="notes">
-            <h3>📚 Greeks Explained</h3>
+        <div id="error" class="error" style="display: none;"></div>
+        
+        <div id="results"></div>
+        
+        <div class="notes-section">
+            <h3>📚 Options Greeks Explained</h3>
             <div class="greeks-explanation">
                 <div class="greek-item">
                     <h4>Delta (Δ)</h4>
-                    <p>Measures price sensitivity to underlying stock movement. Call deltas range 0-1, put deltas range -1-0. Higher absolute delta = more price movement per $1 stock change.</p>
+                    <p>Measures price sensitivity to underlying stock movement. Call deltas: 0 to 1, Put deltas: -1 to 0. Higher absolute values = more sensitive to stock price changes.</p>
                 </div>
                 <div class="greek-item">
                     <h4>Gamma (Γ)</h4>
-                    <p>Rate of change of delta. Higher gamma means delta changes rapidly as stock price moves. ATM options have highest gamma.</p>
+                    <p>Rate of change of delta. Higher gamma = delta changes more rapidly. ATM options typically have highest gamma. Important for delta hedging.</p>
                 </div>
                 <div class="greek-item">
                     <h4>Theta (Θ)</h4>
-                    <p>Time decay. Shows daily option value loss due to time passage. Always negative for long positions. Higher absolute theta = faster decay.</p>
+                    <p>Time decay per day. Usually negative for long positions. Shows how much option value decreases daily. Accelerates as expiration approaches.</p>
                 </div>
                 <div class="greek-item">
                     <h4>Vega (ν)</h4>
-                    <p>Volatility sensitivity. Shows option price change per 1% volatility change. Higher vega = more sensitive to volatility changes.</p>
+                    <p>Sensitivity to implied volatility changes. Higher vega = more sensitive to volatility. ATM options and longer-dated options typically have higher vega.</p>
                 </div>
             </div>
             
-            <div class="conservative-section">
+            <div class="conservative-notes">
                 <h4>🛡️ Conservative Trading Guidelines</h4>
-                <ul class="conservative-list">
-                    <li><strong>Delta:</strong> 0.15-0.85 for calls, -0.85 to -0.15 for puts (avoid extreme ITM/OTM)</li>
-                    <li><strong>Volume:</strong> Minimum 50 contracts for liquidity</li>
-                    <li><strong>Open Interest:</strong> Minimum 100 contracts for market depth</li>
-                    <li><strong>Days to Expiration:</strong> 30-120 days (avoid weekly options)</li>
-                    <li><strong>Theta:</strong> Maximum absolute value of 0.05 to limit time decay</li>
-                    <li><strong>Implied Volatility:</strong> Compare to historical volatility for fair pricing</li>
-                    <li><strong>ATM Filter:</strong> Focus on strikes within ±3 of current price for balanced risk/reward</li>
+                <ul>
+                    <li><strong>Delta:</strong> 0.3-0.7 for moderate directional exposure</li>
+                    <li><strong>Gamma:</strong> 0.01-0.05 to avoid excessive delta swings</li>
+                    <li><strong>Theta:</strong> -0.05 to -0.15 for manageable time decay</li>
+                    <li><strong>Vega:</strong> 0.05-0.20 to limit volatility risk</li>
+                    <li><strong>Volume & OI:</strong> Minimum 50+ for liquidity</li>
+                    <li><strong>Time:</strong> 30-90 days to expiration for optimal time decay balance</li>
                 </ul>
             </div>
         </div>
     </div>
 
     <script>
-        let allData = {};
-        let filteredData = {};
-        let atmOnly = false;
+        let rawData = {};
         
-        async function loadData() {
-            try {
-                const response = await fetch('/api/options');
-                allData = await response.json();
-                filteredData = JSON.parse(JSON.stringify(allData));
-                renderData();
-            } catch (error) {
-                console.error('Error loading data:', error);
-                document.getElementById('content').innerHTML = '<div class="loading"><p>❌ Error loading data. Please refresh the page.</p></div>';
+        function fetchData() {
+            const tickers = document.getElementById('tickers').value;
+            if (!tickers.trim()) {
+                alert('Please enter at least one ticker symbol');
+                return;
             }
+            
+            document.getElementById('loading').style.display = 'block';
+            document.getElementById('error').style.display = 'none';
+            document.getElementById('results').innerHTML = '';
+            
+            fetch('/api/options', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    tickers: tickers.split(',').map(t => t.trim().toUpperCase())
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                document.getElementById('loading').style.display = 'none';
+                if (data.error) {
+                    document.getElementById('error').textContent = data.error;
+                    document.getElementById('error').style.display = 'block';
+                } else {
+                    rawData = data;
+                    displayResults(data);
+                }
+            })
+            .catch(error => {
+                document.getElementById('loading').style.display = 'none';
+                document.getElementById('error').textContent = 'Error fetching data: ' + error.message;
+                document.getElementById('error').style.display = 'block';
+            });
         }
         
-        function applyConservativeFilters() {
-            document.getElementById('deltaMin').value = '0.15';
-            document.getElementById('deltaMax').value = '0.85';
+        function displayResults(data) {
+            const resultsDiv = document.getElementById('results');
+            resultsDiv.innerHTML = '';
+            
+            Object.keys(data).forEach(ticker => {
+                const tickerData = data[ticker];
+                if (!tickerData || tickerData.error) {
+                    resultsDiv.innerHTML += `
+                        <div class="error">
+                            Error loading data for ${ticker}: ${tickerData?.error || 'Unknown error'}
+                        </div>
+                    `;
+                    return;
+                }
+                
+                const tickerDiv = document.createElement('div');
+                tickerDiv.className = 'ticker-section';
+                tickerDiv.innerHTML = `
+                    <div class="ticker-header">
+                        <div class="ticker-name">${ticker}</div>
+                        <div class="current-price">$${tickerData.current_price.toFixed(2)}</div>
+                    </div>
+                `;
+                
+                Object.keys(tickerData.expirations).forEach(expDate => {
+                    const expData = tickerData.expirations[expDate];
+                    const expDiv = document.createElement('div');
+                    expDiv.className = 'expiration-section';
+                    
+                    expDiv.innerHTML = `
+                        <div class="expiration-header">
+                            <span>Expiration: ${expDate}</span>
+                            <span>${expData.days_to_expiry} days to expiry</span>
+                        </div>
+                        <div class="options-container">
+                            <div class="options-type calls-section">
+                                <h4>📈 Call Options</h4>
+                                ${generateOptionsTable(expData.calls, tickerData.current_price)}
+                            </div>
+                            <div class="options-type puts-section">
+                                <h4>📉 Put Options</h4>
+                                ${generateOptionsTable(expData.puts, tickerData.current_price)}
+                            </div>
+                        </div>
+                    `;
+                    
+                    tickerDiv.appendChild(expDiv);
+                });
+                
+                resultsDiv.appendChild(tickerDiv);
+            });
+        }
+        
+        function generateOptionsTable(options, currentPrice) {
+            if (!options || options.length === 0) {
+                return '<p>No options data available</p>';
+            }
+            
+            let tableHTML = `
+                <table class="options-table">
+                    <thead>
+                        <tr>
+                            <th>Strike</th>
+                            <th>Last</th>
+                            <th>Bid</th>
+                            <th>Ask</th>
+                            <th>Vol</th>
+                            <th>OI</th>
+                            <th>IV</th>
+                            <th>Δ</th>
+                            <th>Γ</th>
+                            <th>Θ</th>
+                            <th>ν</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+            `;
+            
+            options.forEach(option => {
+                const isATM = Math.abs(option.strike - currentPrice) <= (currentPrice * 0.05);
+                const rowClass = isATM ? 'atm-option' : '';
+                
+                tableHTML += `
+                    <tr class="${rowClass}" data-option='${JSON.stringify(option)}'>
+                        <td>$${option.strike.toFixed(2)}</td>
+                        <td>$${option.lastPrice.toFixed(2)}</td>
+                        <td>$${option.bid.toFixed(2)}</td>
+                        <td>$${option.ask.toFixed(2)}</td>
+                        <td>${option.volume || 0}</td>
+                        <td>${option.openInterest || 0}</td>
+                        <td>${(option.impliedVolatility * 100).toFixed(1)}%</td>
+                        <td>${option.delta.toFixed(3)}</td>
+                        <td>${option.gamma.toFixed(3)}</td>
+                        <td>${option.theta.toFixed(3)}</td>
+                        <td>${option.vega.toFixed(3)}</td>
+                    </tr>
+                `;
+            });
+            
+            tableHTML += `
+                    </tbody>
+                </table>
+            `;
+            
+            return tableHTML;
+        }
+        
+        function setConservativeFilters() {
+            document.getElementById('minDelta').value = '0.3';
+            document.getElementById('maxDelta').value = '0.7';
+            document.getElementById('minGamma').value = '0.01';
+            document.getElementById('maxGamma').value = '0.05';
+            document.getElementById('minTheta').value = '-0.15';
+            document.getElementById('maxTheta').value = '-0.05';
+            document.getElementById('minVega').value = '0.05';
+            document.getElementById('maxVega').value = '0.20';
             document.getElementById('minVolume').value = '50';
-            document.getElementById('minOpenInterest').value = '100';
-            document.getElementById('minDays').value = '30';
-            document.getElementById('maxDays').value = '120';
-            document.getElementById('maxTheta').value = '0.05';
-            document.getElementById('minVega').value = '0.01';
+            document.getElementById('minOpenInterest').value = '50';
+            document.getElementById('atmFilter').value = 'atm';
+            document.getElementById('daysFilter').value = '90';
+            
+            applyFilters();
+        }
+        
+        function resetFilters() {
+            document.getElementById('minDelta').value = '-1';
+            document.getElementById('maxDelta').value = '1';
+            document.getElementById('minGamma').value = '0';
+            document.getElementById('maxGamma').value = '1';
+            document.getElementById('minTheta').value = '-10';
+            document.getElementById('maxTheta').value = '10';
+            document.getElementById('minVega').value = '0';
+            document.getElementById('maxVega').value = '10';
+            document.getElementById('minVolume').value = '0';
+            document.getElementById('minOpenInterest').value = '0';
+            document.getElementById('atmFilter').value = 'all';
+            document.getElementById('daysFilter').value = 'all';
+            
             applyFilters();
         }
         
         function applyFilters() {
+            if (Object.keys(rawData).length === 0) {
+                return;
+            }
+            
             const filters = {
-                deltaMin: parseFloat(document.getElementById('deltaMin').value) || -1,
-                deltaMax: parseFloat(document.getElementById('deltaMax').value) || 1,
-                minVolume: parseInt(document.getElementById('minVolume').value) || 0,
-                minOpenInterest: parseInt(document.getElementById('minOpenInterest').value) || 0,
-                minDays: parseInt(document.getElementById('minDays').value) || 0,
-                maxDays: parseInt(document.getElementById('maxDays').value) || 365,
-                maxTheta: parseFloat(document.getElementById('maxTheta').value) || 1,
-                minVega: parseFloat(document.getElementById('minVega').value) || 0
+                minDelta: parseFloat(document.getElementById('minDelta').value),
+                maxDelta: parseFloat(document.getElementById('maxDelta').value),
+                minGamma: parseFloat(document.getElementById('minGamma').value),
+                maxGamma: parseFloat(document.getElementById('maxGamma').value),
+                minTheta: parseFloat(document.getElementById('minTheta').value),
+                maxTheta: parseFloat(document.getElementById('maxTheta').value),
+                minVega: parseFloat(document.getElementById('minVega').value),
+                maxVega: parseFloat(document.getElementById('maxVega').value),
+                minVolume: parseInt(document.getElementById('minVolume').value),
+                minOpenInterest: parseInt(document.getElementById('minOpenInterest').value),
+                atmFilter: document.getElementById('atmFilter').value,
+                daysFilter: document.getElementById('daysFilter').value
             };
             
-            filteredData = {};
+            const filteredData = {};
             
-            for (const ticker in allData) {
+            Object.keys(rawData).forEach(ticker => {
+                const tickerData = rawData[ticker];
+                if (!tickerData || tickerData.error) {
+                    filteredData[ticker] = tickerData;
+                    return;
+                }
+                
                 filteredData[ticker] = {
-                    ...allData[ticker],
+                    ...tickerData,
                     expirations: {}
                 };
                 
-                for (const expDate in allData[ticker].expirations) {
-                    const expData = allData[ticker].expirations[expDate];
+                Object.keys(tickerData.expirations).forEach(expDate => {
+                    const expData = tickerData.expirations[expDate];
                     
-                    // Filter calls
-                    const filteredCalls = expData.calls.filter(option => 
-                        filterOption(option, filters, 'call', allData[ticker].currentPrice)
-                    );
+                    // Filter by days to expiration
+                    if (filters.daysFilter !== 'all' && expData.days_to_expiry > parseInt(filters.daysFilter)) {
+                        return;
+                    }
                     
-                    // Filter puts
-                    const filteredPuts = expData.puts.filter(option => 
-                        filterOption(option, filters, 'put', allData[ticker].currentPrice)
-                    );
+                    const filteredCalls = expData.calls.filter(option => filterOption(option, filters, tickerData.current_price));
+                    const filteredPuts = expData.puts.filter(option => filterOption(option, filters, tickerData.current_price));
                     
                     if (filteredCalls.length > 0 || filteredPuts.length > 0) {
                         filteredData[ticker].expirations[expDate] = {
@@ -721,223 +914,39 @@ HTML_TEMPLATE = """
                             puts: filteredPuts
                         };
                     }
-                }
-            }
+                });
+            });
             
-            renderData();
+            displayResults(filteredData);
         }
         
-        function filterOption(option, filters, type, currentPrice) {
-            // Days to expiration filter
-            if (option.daysToExpiration < filters.minDays || option.daysToExpiration > filters.maxDays) {
-                return false;
+        function filterOption(option, filters, currentPrice) {
+            // ATM filter
+            if (filters.atmFilter === 'atm') {
+                const strikeCount = 3;
+                const priceRange = currentPrice * 0.1; // 10% range
+                if (Math.abs(option.strike - currentPrice) > priceRange) {
+                    return false;
+                }
             }
+            
+            // Greeks filters
+            if (option.delta < filters.minDelta || option.delta > filters.maxDelta) return false;
+            if (option.gamma < filters.minGamma || option.gamma > filters.maxGamma) return false;
+            if (option.theta < filters.minTheta || option.theta > filters.maxTheta) return false;
+            if (option.vega < filters.minVega || option.vega > filters.maxVega) return false;
             
             // Volume and Open Interest filters
-            if (option.volume < filters.minVolume || option.openInterest < filters.minOpenInterest) {
-                return false;
-            }
-            
-            // Delta filter (considering call/put differences)
-            if (type === 'call') {
-                if (option.delta < filters.deltaMin || option.delta > filters.deltaMax) {
-                    return false;
-                }
-            } else { // put
-                if (option.delta > -filters.deltaMin || option.delta < -filters.deltaMax) {
-                    return false;
-                }
-            }
-            
-            // Theta filter (absolute value)
-            if (Math.abs(option.theta) > filters.maxTheta) {
-                return false;
-            }
-            
-            // Vega filter
-            if (option.vega < filters.minVega) {
-                return false;
-            }
-            
-            // ATM filter
-            if (atmOnly) {
-                const priceDiff = Math.abs(option.strike - currentPrice);
-                const atmThreshold = currentPrice * 0.05; // 5% threshold
-                if (priceDiff > atmThreshold) {
-                    return false;
-                }
-            }
+            if ((option.volume || 0) < filters.minVolume) return false;
+            if ((option.openInterest || 0) < filters.minOpenInterest) return false;
             
             return true;
         }
         
-        function clearFilters() {
-            document.getElementById('deltaMin').value = '';
-            document.getElementById('deltaMax').value = '';
-            document.getElementById('minVolume').value = '';
-            document.getElementById('minOpenInterest').value = '';
-            document.getElementById('minDays').value = '';
-            document.getElementById('maxDays').value = '';
-            document.getElementById('maxTheta').value = '';
-            document.getElementById('minVega').value = '';
-            
-            filteredData = JSON.parse(JSON.stringify(allData));
-            renderData();
-        }
-        
-        function toggleATM() {
-            atmOnly = !atmOnly;
-            applyFilters();
-        }
-        
-        function isATM(strike, currentPrice) {
-            return Math.abs(strike - currentPrice) <= currentPrice * 0.03; // 3% threshold
-        }
-        
-        function renderData() {
-            let html = '';
-            
-            if (Object.keys(filteredData).length === 0) {
-                html = '<div class="loading"><p>No data available or all options filtered out.</p></div>';
-            } else {
-                for (const ticker in filteredData) {
-                    const tickerData = filteredData[ticker];
-                    html += `
-                        <div class="ticker-section">
-                            <div class="ticker-header">
-                                <h2>${ticker}</h2>
-                                <div class="current-price">$${tickerData.currentPrice.toFixed(2)}</div>
-                            </div>
-                    `;
-                    
-                    for (const expDate in tickerData.expirations) {
-                        const expData = tickerData.expirations[expDate];
-                        html += `
-                            <div class="expiration-section">
-                                <div class="expiration-header">
-                                    <h3>Expiration: ${expDate} (${expData.daysToExpiration} days)</h3>
-                                </div>
-                                <div class="options-container">
-                        `;
-                        
-                        // Calls
-                        html += `
-                            <div class="options-type">
-                                <h4 class="calls-header">CALLS (${expData.calls.length})</h4>
-                                <table class="options-table">
-                                    <thead>
-                                        <tr>
-                                            <th>Strike</th>
-                                            <th>Last</th>
-                                            <th>Bid</th>
-                                            <th>Ask</th>
-                                            <th>Vol</th>
-                                            <th>OI</th>
-                                            <th>IV</th>
-                                            <th>Δ</th>
-                                            <th>Γ</th>
-                                            <th>Θ</th>
-                                            <th>ν</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody>
-                        `;
-                        
-                        expData.calls.forEach(call => {
-                            const isAtmOption = isATM(call.strike, tickerData.currentPrice);
-                            html += `
-                                <tr ${isAtmOption ? 'class="atm-row"' : ''}>
-                                    <td>$${call.strike.toFixed(2)}</td>
-                                    <td>$${call.lastPrice.toFixed(2)}</td>
-                                    <td>$${call.bid.toFixed(2)}</td>
-                                    <td>$${call.ask.toFixed(2)}</td>
-                                    <td>${call.volume}</td>
-                                    <td>${call.openInterest}</td>
-                                    <td>${(call.impliedVolatility * 100).toFixed(1)}%</td>
-                                    <td>${call.delta.toFixed(3)}</td>
-                                    <td>${call.gamma.toFixed(4)}</td>
-                                    <td>${call.theta.toFixed(3)}</td>
-                                    <td>${call.vega.toFixed(3)}</td>
-                                </tr>
-                            `;
-                        });
-                        
-                        html += `
-                                    </tbody>
-                                </table>
-                            </div>
-                        `;
-                        
-                        // Puts
-                        html += `
-                            <div class="options-type">
-                                <h4 class="puts-header">PUTS (${expData.puts.length})</h4>
-                                <table class="options-table">
-                                    <thead>
-                                        <tr>
-                                            <th>Strike</th>
-                                            <th>Last</th>
-                                            <th>Bid</th>
-                                            <th>Ask</th>
-                                            <th>Vol</th>
-                                            <th>OI</th>
-                                            <th>IV</th>
-                                            <th>Δ</th>
-                                            <th>Γ</th>
-                                            <th>Θ</th>
-                                            <th>ν</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody>
-                        `;
-                        
-                        expData.puts.forEach(put => {
-                            const isAtmOption = isATM(put.strike, tickerData.currentPrice);
-                            html += `
-                                <tr ${isAtmOption ? 'class="atm-row"' : ''}>
-                                    <td>$${put.strike.toFixed(2)}</td>
-                                    <td>$${put.lastPrice.toFixed(2)}</td>
-                                    <td>$${put.bid.toFixed(2)}</td>
-                                    <td>$${put.ask.toFixed(2)}</td>
-                                    <td>${put.volume}</td>
-                                    <td>${put.openInterest}</td>
-                                    <td>${(put.impliedVolatility * 100).toFixed(1)}%</td>
-                                    <td>${put.delta.toFixed(3)}</td>
-                                    <td>${put.gamma.toFixed(4)}</td>
-                                    <td>${put.theta.toFixed(3)}</td>
-                                    <td>${put.vega.toFixed(3)}</td>
-                                </tr>
-                            `;
-                        });
-                        
-                        html += `
-                                    </tbody>
-                                </table>
-                            </div>
-                        `;
-                        
-                        html += `
-                                </div>
-                            </div>
-                        `;
-                    }
-                    
-                    html += '</div>';
-                }
-            }
-            
-            document.getElementById('content').innerHTML = html;
-        }
-        
-        async function refreshData() {
-            document.getElementById('content').innerHTML = '<div class="loading"><p>🔄 Refreshing data...</p></div>';
-            await fetch('/api/refresh', { method: 'POST' });
-            setTimeout(loadData, 2000); // Wait a bit for data to refresh
-        }
-        
-        // Load data when page loads
+        // Auto-fetch data on page load with default tickers
         window.onload = function() {
-            setTimeout(loadData, 1000);
+            // You can uncomment the line below to auto-fetch data on load
+            // fetchData();
         };
     </script>
 </body>
@@ -945,69 +954,73 @@ HTML_TEMPLATE = """
 """
 
 @app.route('/')
-def dashboard():
+def index():
     return render_template_string(HTML_TEMPLATE)
 
-@app.route('/api/options')
+@app.route('/api/options', methods=['POST'])
 def get_options():
-    return jsonify(options_data)
-
-@app.route('/api/refresh', methods=['POST'])
-def refresh_options():
-    threading.Thread(target=update_options_data, daemon=True).start()
-    return jsonify({"status": "refreshing"})
+    try:
+        data = request.get_json()
+        tickers = data.get('tickers', [])
+        
+        if not tickers:
+            return jsonify({'error': 'No tickers provided'})
+        
+        results = {}
+        for ticker in tickers:
+            ticker = ticker.strip().upper()
+            if ticker:
+                print(f"Fetching data for {ticker}...")
+                options_data = analyzer.get_options_data(ticker)
+                if options_data:
+                    results[ticker] = options_data
+                else:
+                    results[ticker] = {'error': f'Could not fetch data for {ticker}'}
+        
+        return jsonify(results)
+    
+    except Exception as e:
+        return jsonify({'error': str(e)})
 
 def run_flask_app():
     """Run Flask app in a separate thread"""
     app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
 
 def main():
-    """Main function to run the dashboard"""
-    global tickers_list
-    
-    print("🚀 Stock Options Dashboard")
-    print("=" * 50)
-    
-    # Get ticker symbols from user
-    tickers_input = input("Enter comma-separated ticker symbols (e.g., AAPL,MSFT,TSLA): ").strip()
-    if not tickers_input:
-        print("No tickers provided. Using default: AAPL,MSFT,TSLA")
-        tickers_input = "AAPL,MSFT,TSLA"
-    
-    tickers_list = [ticker.strip().upper() for ticker in tickers_input.split(',')]
-    print(f"Fetching data for: {', '.join(tickers_list)}")
-    
-    # Initial data fetch
-    print("\n📊 Fetching initial options data...")
-    update_options_data()
+    """Main function to run the application"""
+    print("🚀 Starting Stock Options Dashboard...")
+    print("📦 Installing required packages...")
     
     # Start Flask app in background thread
-    print("\n🌐 Starting web server...")
     flask_thread = threading.Thread(target=run_flask_app, daemon=True)
     flask_thread.start()
     
-    # Wait a moment for server to start
-    time.sleep(2)
+    # Wait a moment for Flask to start
+    time.sleep(3)
     
-    print("\n✅ Dashboard is ready!")
-    print("🔗 Access your dashboard at: http://localhost:5000")
+    print("\n" + "="*60)
+    print("✅ Stock Options Dashboard is running!")
+    print("="*60)
+    print("🌐 Access your dashboard at: http://localhost:5000")
     print("\n📋 Features available:")
-    print("• Interactive filtering by Greeks, volume, and days to expiration")
-    print("• Conservative defaults button for safe trading parameters")
-    print("• At-the-money (ATM) filter showing ±3 strike prices from current price")
-    print("• Real-time data refresh capability")
-    print("• Comprehensive Greeks calculations and explanations")
-    print("• Mobile-responsive design")
+    print("   • Interactive options data for multiple tickers")
+    print("   • Complete Greeks calculations (Delta, Gamma, Theta, Vega)")
+    print("   • Advanced filtering system")
+    print("   • At-the-money (ATM) filtering")
+    print("   • Days to expiration filtering")
+    print("   • Conservative trading presets")
+    print("   • Educational content about Greeks")
+    print("\n🎯 Default tickers: AAPL, MSFT (you can change these)")
+    print("📚 Click 'Conservative Defaults' for safe trading parameters")
+    print("\n⚠️  Note: This will run until you stop the cell execution")
+    print("="*60)
     
-    print("\n⚠️  Note: Keep this cell running to maintain the web server!")
-    print("Press Ctrl+C to stop the server when done.")
-    
+    # Keep the main thread alive
     try:
-        # Keep the main thread alive
         while True:
-            time.sleep(10)
+            time.sleep(1)
     except KeyboardInterrupt:
-        print("\n🛑 Shutting down dashboard...")
+        print("\n🛑 Dashboard stopped by user")
 
 if __name__ == "__main__":
     main()
