@@ -45,7 +45,14 @@ def install_packages():
             __import__(package.replace('-', '_'))
         except ImportError:
             print(f"Installing {package}...")
-            subprocess.check_call([sys.executable, '-m', 'pip', 'install', package])
+            try:
+                subprocess.check_call([sys.executable, '-m', 'pip', 'install', package])
+            except subprocess.CalledProcessError:
+                # Try with --break-system-packages for externally managed environments
+                try:
+                    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--break-system-packages', package])
+                except subprocess.CalledProcessError:
+                    print(f"Failed to install {package}")
 
 install_packages()
 
